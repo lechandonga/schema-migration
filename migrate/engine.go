@@ -35,6 +35,7 @@ func (e *Engine) ensureTables(ctx context.Context) error {
 }
 
 // acquireWithRetry 在 AcquireTimeout 内按 RetryInterval 重试获取租约。
+// 若配置为 ContentionYield 策略，首次尝试失败即返回 errYielded。
 func (e *Engine) acquireWithRetry(ctx context.Context, l *lease) error {
 	deadline := time.Now().Add(e.cfg.AcquireTimeout)
 	for {
@@ -44,6 +45,9 @@ func (e *Engine) acquireWithRetry(ctx context.Context, l *lease) error {
 		}
 		if ok {
 			return nil
+		}
+		if e.cfg.Contention == ContentionYield {
+			return errYielded
 		}
 		if time.Now().After(deadline) {
 			return ErrLeaseBusy
@@ -114,7 +118,8 @@ func (e *Engine) withLease(ctx context.Context, fn func(ctx context.Context) err
 	}
 }
 
-// checkPlan 校验计划兼容性；除非 AllowDestructive，否则拒绝破坏性变更。
+// checkPlan 校验待执行迁移的兼容性；除非 AllowDestructive，否则拒绝破坏性变更。
+// 注意：只对本次真正要执行的迁移调用，已落库的历史版本不参与判断。
 func (e *Engine) checkPlan(migrations []Migration, dir Direction) error {
 	if dir != Up || e.cfg.AllowDestructive {
 		return nil
@@ -126,28 +131,54 @@ func (e *Engine) checkPlan(migrations []Migration, dir Direction) error {
 	return nil
 }
 
+// pending 过滤出尚未应用的迁移（保持版本升序）。
+func (e *Engine) pending(ctx context.Context, sorted []Migration) ([]Migration, error) {
+	var out []Migration
+	for _, m := range sorted {
+		rec, err := e.recordOf(ctx, m.Version)
+		if err != nil {
+			return nil, err
+		}
+		if rec != nil && rec.State == "applied" {
+			continue // 已应用，跳过
+		}
+		out = append(out, m)
+	}
+	return out, nil
+}
+
 // Migrate 按版本顺序应用所有未执行的迁移。
 // 已应用的版本自动跳过；上次失败的版本在事务保证下安全重试。
-func (e *Engine) Migrate(ctx context.Context, migrations []Migration) error {
-	if err := e.checkPlan(migrations, Up); err != nil {
-		return err
-	}
+// 兼容性校验只针对本次真正要执行的迁移：历史中已落库的破坏性版本
+// 不会反复拦截后续常规兼容的迁移。
+//
+// 返回的 Outcome 区分两种正常结果：OutcomeExecuted（本次由我执行完成）
+// 与 OutcomeYielded（已有其他实例在执行，按让出策略正常返回）。
+// 等待策略下超时仍未拿到执行权时返回 ErrLeaseBusy。
+func (e *Engine) Migrate(ctx context.Context, migrations []Migration) (Outcome, error) {
 	sorted := sortMigrations(migrations)
-	return e.withLease(ctx, func(ctx context.Context) error {
-		for _, m := range sorted {
-			rec, err := e.recordOf(ctx, m.Version)
-			if err != nil {
-				return err
-			}
-			if rec != nil && rec.State == "applied" {
-				continue // 已应用，跳过
-			}
+	err := e.withLease(ctx, func(ctx context.Context) error {
+		todo, err := e.pending(ctx, sorted)
+		if err != nil {
+			return err
+		}
+		if err := e.checkPlan(todo, Up); err != nil {
+			return err
+		}
+		for _, m := range todo {
 			if err := e.applyOne(ctx, m, Up); err != nil {
 				return err
 			}
 		}
 		return nil
 	})
+	if errors.Is(err, errYielded) {
+		return OutcomeYielded, nil
+	}
+	if err != nil {
+		return OutcomeExecuted, err
+	}
+	return OutcomeExecuted, nil
 }
 
 // RollbackTo 按逆序回滚所有版本号大于 target 的已应用迁移。

@@ -2,6 +2,7 @@ package migrate
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"testing"
@@ -51,7 +52,7 @@ func TestMigrateAppliesInOrderAndSkipsApplied(t *testing.T) {
 	e := New(db, fastConfig(), "i1")
 	ms := sampleMigrations()
 
-	if err := e.Migrate(t.Context(), ms[:2]); err != nil {
+	if _, err := e.Migrate(t.Context(), ms[:2]); err != nil {
 		t.Fatal(err)
 	}
 	applied, err := e.Applied(t.Context())
@@ -63,7 +64,7 @@ func TestMigrateAppliesInOrderAndSkipsApplied(t *testing.T) {
 	}
 
 	// 再次运行：已应用版本不得重复执行，仅追加版本 3。
-	if err := e.Migrate(t.Context(), ms); err != nil {
+	if _, err := e.Migrate(t.Context(), ms); err != nil {
 		t.Fatal(err)
 	}
 	applied, _ = e.Applied(t.Context())
@@ -76,7 +77,7 @@ func TestRollbackToRevertsInReverseOrder(t *testing.T) {
 	db := openTestDB(t)
 	e := New(db, fastConfig(), "i1")
 	ms := sampleMigrations()
-	if err := e.Migrate(t.Context(), ms); err != nil {
+	if _, err := e.Migrate(t.Context(), ms); err != nil {
 		t.Fatal(err)
 	}
 	if err := e.RollbackTo(t.Context(), ms, 1); err != nil {
@@ -111,7 +112,7 @@ func TestResumeAfterFailureLeavesNoPartialState(t *testing.T) {
 			Up:   []string{"CREATE TABLE t2 (id INTEGER)", "THIS IS NOT SQL"},
 			Down: []string{"DROP TABLE t2"}},
 	}
-	if err := e.Migrate(t.Context(), bad); err == nil {
+	if _, err := e.Migrate(t.Context(), bad); err == nil {
 		t.Fatal("期望迁移失败")
 	}
 	// 失败的版本 2 在事务中整体回滚，不应留下 t2 表。
@@ -135,7 +136,7 @@ func TestResumeAfterFailureLeavesNoPartialState(t *testing.T) {
 			Up:   []string{"CREATE TABLE t2 (id INTEGER)"},
 			Down: []string{"DROP TABLE t2"}},
 	}
-	if err := e.Migrate(t.Context(), fixed); err != nil {
+	if _, err := e.Migrate(t.Context(), fixed); err != nil {
 		t.Fatalf("恢复执行失败: %v", err)
 	}
 	applied, _ = e.Applied(t.Context())
@@ -156,5 +157,71 @@ func TestRecordOfMissing(t *testing.T) {
 	}
 	if rec != nil {
 		t.Fatal("期望无记录")
+	}
+}
+
+// TestHistoryDestructiveDoesNotBlockCompatible 历史里已应用过破坏性版本后，
+// 后续只追加常规兼容版本时不应再被拒绝。
+func TestHistoryDestructiveDoesNotBlockCompatible(t *testing.T) {
+	db := openTestDB(t)
+	ctx := t.Context()
+
+	destructive := []Migration{
+		{Version: 1, Name: "create_users",
+			Up:   []string{"CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)"},
+			Down: []string{"DROP TABLE users"}},
+		{Version: 2, Name: "drop_name",
+			Up:   []string{"ALTER TABLE users DROP COLUMN name"},
+			Down: []string{"ALTER TABLE users ADD COLUMN name TEXT"}},
+	}
+	// 收缩阶段：显式放行后落库破坏性版本。
+	cfg := fastConfig()
+	cfg.AllowDestructive = true
+	if _, err := New(db, cfg, "i1").Migrate(ctx, destructive); err != nil {
+		t.Fatalf("放行后破坏性迁移应成功: %v", err)
+	}
+
+	// 后续常规迭代：携带历史版本 + 新增兼容版本，默认配置（不放行）应正常执行。
+	next := append(destructive, Migration{
+		Version: 3, Name: "add_email",
+		Up:   []string{"ALTER TABLE users ADD COLUMN email TEXT"},
+		Down: []string{"ALTER TABLE users DROP COLUMN email"},
+	})
+	e := New(db, fastConfig(), "i1")
+	if _, err := e.Migrate(ctx, next); err != nil {
+		t.Fatalf("历史破坏性版本不应拦截兼容迁移: %v", err)
+	}
+	applied, _ := e.Applied(ctx)
+	if len(applied) != 3 {
+		t.Fatalf("期望 3 条记录, got %+v", applied)
+	}
+}
+
+// TestPendingDestructiveStillRejected 待执行版本含破坏性变更时仍被拒绝，
+// 且错误能区分具体类别。
+func TestPendingDestructiveStillRejected(t *testing.T) {
+	db := openTestDB(t)
+	ctx := t.Context()
+	e := New(db, fastConfig(), "i1")
+	if _, err := e.Migrate(ctx, sampleMigrations()); err != nil {
+		t.Fatal(err)
+	}
+	pending := append(sampleMigrations(), Migration{
+		Version: 4, Name: "drop_orders",
+		Up:   []string{"DROP TABLE orders"},
+		Down: []string{"CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER)"},
+	})
+	_, err := e.Migrate(ctx, pending)
+	var cerr *CompatibilityError
+	if !errors.As(err, &cerr) {
+		t.Fatalf("期望 CompatibilityError, got %v", err)
+	}
+	if !cerr.HasKind(ViolationDropTable) {
+		t.Fatalf("应识别 drop_table 类别: %v", cerr.Kinds())
+	}
+	// 被拒绝的版本不得默默执行。
+	applied, _ := e.Applied(ctx)
+	if len(applied) != 3 {
+		t.Fatalf("破坏性版本不应被执行: %+v", applied)
 	}
 }

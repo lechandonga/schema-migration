@@ -49,7 +49,7 @@ func TestValidatePlanAllowsCompatibleChanges(t *testing.T) {
 func TestMigrateRejectsDestructivePlan(t *testing.T) {
 	db := openTestDB(t)
 	e := New(db, DefaultConfig(), "instance-1")
-	err := e.Migrate(t.Context(), []Migration{
+	_, err := e.Migrate(t.Context(), []Migration{
 		{Version: 1, Name: "drop", Up: []string{"ALTER TABLE t DROP COLUMN c"}, Down: []string{"ALTER TABLE t ADD COLUMN c TEXT"}},
 	})
 	var ce *CompatibilityError
