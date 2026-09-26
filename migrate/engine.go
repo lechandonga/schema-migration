@@ -172,13 +172,7 @@ func (e *Engine) Migrate(ctx context.Context, migrations []Migration) (Outcome, 
 		}
 		return nil
 	})
-	if errors.Is(err, errYielded) {
-		return OutcomeYielded, nil
-	}
-	if err != nil {
-		return OutcomeExecuted, err
-	}
-	return OutcomeExecuted, nil
+	return outcomeOf(err)
 }
 
 // RollbackTo 按逆序回滚所有版本号大于 target 的已应用迁移。
