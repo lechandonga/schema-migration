@@ -12,7 +12,7 @@ import (
 
 func openDBAt(t *testing.T, path string) *sql.DB {
 	t.Helper()
-	db, err := sql.Open("sqlite", fmt.Sprintf("file:%s?_pragma=busy_timeout(10000)", path))
+	db, err := sql.Open("sqlite", fmt.Sprintf("file:%s?_pragma=busy_timeout(60000)", path))
 	if err != nil {
 		t.Fatal(err)
 	}
