@@ -17,6 +17,8 @@ type Config struct {
 	// AllowDestructive 允许执行包含破坏性变更的迁移计划。
 	// 仅在已按分阶段路径完成前置阶段后开启。
 	AllowDestructive bool
+	// ContentionPolicy 为执行权被其他实例持有时的策略，默认 ContentionWait。
+	ContentionPolicy ContentionPolicy
 }
 
 // DefaultConfig 返回推荐配置。

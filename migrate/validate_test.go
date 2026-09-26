@@ -60,3 +60,67 @@ func TestMigrateRejectsDestructivePlan(t *testing.T) {
 		t.Fatalf("拒绝原因不可区分: %+v", ce.Violations)
 	}
 }
+
+// TestMigrateIgnoresAppliedDestructiveHistory 历史里已应用的破坏性版本
+// 不应挡住后续只含兼容变更的迁移；兼容性判断只覆盖本次真正待执行的版本。
+func TestMigrateIgnoresAppliedDestructiveHistory(t *testing.T) {
+	db := openTestDB(t)
+	ctx := t.Context()
+
+	destructive := Migration{Version: 1, Name: "create_then_drop",
+		Up: []string{
+			"CREATE TABLE t (id INTEGER PRIMARY KEY, c TEXT)",
+			"ALTER TABLE t DROP COLUMN c",
+		},
+		Down: []string{"DROP TABLE t"}}
+
+	// 收缩阶段：显式放行后执行破坏性版本。
+	cfg := fastConfig()
+	cfg.AllowDestructive = true
+	if err := New(db, cfg, "i1").Migrate(ctx, []Migration{destructive}); err != nil {
+		t.Fatalf("放行后破坏性迁移应成功: %v", err)
+	}
+
+	// 后续常规迭代：追加兼容版本，不再开启 AllowDestructive。
+	compatible := Migration{Version: 2, Name: "add_email",
+		Up:   []string{"ALTER TABLE t ADD COLUMN email TEXT"},
+		Down: []string{"ALTER TABLE t DROP COLUMN email"}}
+	e := New(db, fastConfig(), "i1")
+	if err := e.Migrate(ctx, []Migration{destructive, compatible}); err != nil {
+		t.Fatalf("历史破坏性版本不应挡住兼容迁移: %v", err)
+	}
+	applied, _ := e.Applied(ctx)
+	if len(applied) != 2 {
+		t.Fatalf("期望 2 个版本已应用, got %+v", applied)
+	}
+}
+
+// TestMigrateStillRejectsPendingDestructive 待执行（未应用）的破坏性版本
+// 在没有明确许可时仍必须被拒绝，不会被默默执行。
+func TestMigrateStillRejectsPendingDestructive(t *testing.T) {
+	db := openTestDB(t)
+	ctx := t.Context()
+	e := New(db, fastConfig(), "i1")
+	ok := Migration{Version: 1, Name: "create_t",
+		Up:   []string{"CREATE TABLE t (id INTEGER PRIMARY KEY, c TEXT)"},
+		Down: []string{"DROP TABLE t"}}
+	if err := e.Migrate(ctx, []Migration{ok}); err != nil {
+		t.Fatal(err)
+	}
+	pending := Migration{Version: 2, Name: "drop_c",
+		Up:   []string{"ALTER TABLE t DROP COLUMN c"},
+		Down: []string{"ALTER TABLE t ADD COLUMN c TEXT"}}
+	err := e.Migrate(ctx, []Migration{ok, pending})
+	var ce *CompatibilityError
+	if !errors.As(err, &ce) {
+		t.Fatalf("期望 CompatibilityError, got %v", err)
+	}
+	if ce.Violations[0].Kind != ViolationDropColumn {
+		t.Fatalf("违规类别不符: %+v", ce.Violations)
+	}
+	// 被拒绝的计划不得产生任何执行效果。
+	applied, _ := e.Applied(ctx)
+	if len(applied) != 1 || applied[0].Version != 1 {
+		t.Fatalf("被拒绝的迁移不应落库: %+v", applied)
+	}
+}

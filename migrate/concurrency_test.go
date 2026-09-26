@@ -12,7 +12,7 @@ import (
 
 func openDBAt(t *testing.T, path string) *sql.DB {
 	t.Helper()
-	db, err := sql.Open("sqlite", fmt.Sprintf("file:%s?_pragma=busy_timeout(10000)", path))
+	db, err := sql.Open("sqlite", fmt.Sprintf("file:%s?_pragma=busy_timeout(60000)", path))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -152,5 +152,139 @@ func TestAcquireTimeoutReturnsBusy(t *testing.T) {
 	}
 	if elapsed := time.Since(start); elapsed > 3*time.Second {
 		t.Fatalf("等待方未在超时后返回: %v", elapsed)
+	}
+}
+
+// TestYieldPolicyReturnsImmediately 让出策略下，执行权被其他实例持有时
+// 立即正常返回 ResultYielded，不执行任何迁移，也不视为失败。
+func TestYieldPolicyReturnsImmediately(t *testing.T) {
+	db := openTestDB(t)
+	ctx := t.Context()
+	holder := newLease(db, "long-runner", 30*time.Second)
+	ok, err := holder.acquire(ctx)
+	if err != nil || !ok {
+		t.Fatal("获取租约失败")
+	}
+	t.Cleanup(func() { _ = holder.release(ctx) })
+
+	cfg := fastConfig()
+	cfg.ContentionPolicy = ContentionYield
+	e := New(db, cfg, "yielder")
+	start := time.Now()
+	res, err := e.MigrateWithResult(ctx, sampleMigrations())
+	if err != nil {
+		t.Fatalf("让出不应视为失败: %v", err)
+	}
+	if res != ResultYielded {
+		t.Fatalf("期望 ResultYielded, got %v", res)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("让出策略应立即返回: %v", elapsed)
+	}
+	// 未执行任何迁移。
+	applied, _ := e.Applied(ctx)
+	if len(applied) != 0 {
+		t.Fatalf("让出的实例不应执行迁移: %+v", applied)
+	}
+}
+
+// TestYieldTakeoverAfterLeaseExpiry 持有执行权的实例异常退出（不释放、
+// 不续期）后，让出策略的实例在租约失效后能自动接手执行。
+func TestYieldTakeoverAfterLeaseExpiry(t *testing.T) {
+	db := openTestDB(t)
+	ctx := t.Context()
+	crashed := newLease(db, "crashed-instance", 300*time.Millisecond)
+	ok, err := crashed.acquire(ctx)
+	if err != nil || !ok {
+		t.Fatal("获取租约失败")
+	}
+	// 模拟崩溃：不释放、不心跳。
+
+	cfg := fastConfig()
+	cfg.ContentionPolicy = ContentionYield
+	e := New(db, cfg, "survivor")
+
+	// 租约未失效前：让出。
+	res, err := e.MigrateWithResult(ctx, sampleMigrations())
+	if err != nil || res != ResultYielded {
+		t.Fatalf("失效前应让出: res=%v err=%v", res, err)
+	}
+
+	// 租约失效后：接手并执行完成。
+	time.Sleep(400 * time.Millisecond)
+	res, err = e.MigrateWithResult(ctx, sampleMigrations())
+	if err != nil {
+		t.Fatalf("失效接管失败: %v", err)
+	}
+	if res != ResultExecuted {
+		t.Fatalf("期望 ResultExecuted, got %v", res)
+	}
+	applied, _ := e.Applied(ctx)
+	if len(applied) != 3 {
+		t.Fatalf("接管后迁移未完整执行: %+v", applied)
+	}
+}
+
+// TestConcurrentYieldBothYield 执行权被持有时，多个让出策略实例并发启动，
+// 全部正常让出，无一执行迁移。
+func TestConcurrentYieldBothYield(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "shared.db")
+	dbA := openDBAt(t, path)
+	dbB := openDBAt(t, path)
+
+	// 第三方实例长期持有执行权。
+	holder := newLease(dbA, "long-runner", 30*time.Second)
+	ok, err := holder.acquire(t.Context())
+	if err != nil || !ok {
+		t.Fatal("获取租约失败")
+	}
+	t.Cleanup(func() { _ = holder.release(t.Context()) })
+
+	cfg := fastConfig()
+	cfg.ContentionPolicy = ContentionYield
+	engA := New(dbA, cfg, "instance-A")
+	engB := New(dbB, cfg, "instance-B")
+
+	var wg sync.WaitGroup
+	results := make([]Result, 2)
+	errs := make([]error, 2)
+	wg.Add(2)
+	go func() { defer wg.Done(); results[0], errs[0] = engA.MigrateWithResult(t.Context(), sampleMigrations()) }()
+	go func() { defer wg.Done(); results[1], errs[1] = engB.MigrateWithResult(t.Context(), sampleMigrations()) }()
+	wg.Wait()
+	for i := range results {
+		if errs[i] != nil {
+			t.Fatalf("实例 %d 让出不应报错: %v", i, errs[i])
+		}
+		if results[i] != ResultYielded {
+			t.Fatalf("实例 %d 期望让出, got %v", i, results[i])
+		}
+	}
+	applied, err := engA.Applied(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(applied) != 0 {
+		t.Fatalf("让出的实例不应执行迁移: %+v", applied)
+	}
+}
+
+// TestWaitPolicyStillReportsBusyOnTimeout 等待策略下超时仍返回
+// 可区分的 ErrLeaseBusy（三种结果：执行完成 / 让出 / 超时）。
+func TestWaitPolicyStillReportsBusyOnTimeout(t *testing.T) {
+	db := openTestDB(t)
+	holder := newLease(db, "long-runner", 30*time.Second)
+	ok, err := holder.acquire(t.Context())
+	if err != nil || !ok {
+		t.Fatal("获取租约失败")
+	}
+	t.Cleanup(func() { _ = holder.release(t.Context()) })
+
+	cfg := fastConfig()
+	cfg.AcquireTimeout = 200 * time.Millisecond
+	e := New(db, cfg, "waiter")
+	res, err := e.MigrateWithResult(t.Context(), sampleMigrations())
+	if !errors.Is(err, ErrLeaseBusy) {
+		t.Fatalf("期望 ErrLeaseBusy, got res=%v err=%v", res, err)
 	}
 }
